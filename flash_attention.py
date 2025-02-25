@@ -2,8 +2,14 @@ import torch
 import triton
 import triton.language as tl
 
-# Idea: Adapt Flash Attention for Sliding Window or for another case.
-# This implementation focus on a causal attention ?
+# Self-Attention only with both the causal and non-causal cases.
+# Flash-bidirectional-attention & Flash-causal-attention
+# Change the STAGE system
+# Flash Attention for Sliding Window
+# Multi-Head Latent Flash Attention
+# GQA Flash Attention
+
+############################### Flash Attention Forward/Backward pass ###############################
 
 
 class FlashAttention(torch.autograd.Function):
@@ -15,7 +21,7 @@ class FlashAttention(torch.autograd.Function):
         HEAD_DIM_Q = Q.shape[-1]
         HEAD_DIM_K = K.shape[-1]
         HEAD_DIM_V = V.shape[-1]
-        factor = 1 / HEAD_DIM**0.5
+        softmax_factor = 1 / HEAD_DIM**0.5
 
         # We make sure the HEAD_DIM for Q, K and V are the same.
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
@@ -45,7 +51,7 @@ class FlashAttention(torch.autograd.Function):
             Q=Q,
             K=K,
             V=V,
-            factor=factor,
+            softmax_factor=softmax_factor,
             L=L,
             O=O,
             stride_batch=Q.stride(0),
@@ -59,9 +65,9 @@ class FlashAttention(torch.autograd.Function):
             STAGE=stage,
         )
 
-        ctx.save_for_backward(Q, K, V, 0, M)
+        ctx.save_for_backward(Q, K, V, O, L)
         ctx.grid = grid
-        ctx.factor = factor
+        ctx.softmax_factor = softmax_factor
         ctx.causal = causal
         ctx.HEAD_DIM = HEAD_DIM_K
 
@@ -74,7 +80,7 @@ def _attn_fwd(
     Q,  # (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM)
     K,  # (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM)
     V,  # (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM)
-    factor,
+    softmax_factor,
     L,  # (BATCH_SIZE, NUM_HEADS, SEQ_LEN)
     O,  # (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM)
     stride_batch,
@@ -148,10 +154,10 @@ def _attn_fwd(
         order=(1, 0),
     )
 
-    # offsets for the tokens in Q to process
+    # array of indices which represent the offsets for the tokens in Q to process
     query_offsets = block_index_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
 
-    # offsets for the tokens in K and V sequence to process
+    # array of indices which represent the offsets for the tokens in K and V sequence to process
     key_values_offsets = tl.arange(0, BLOCK_SIZE_KV)
 
     # maximum for each query
@@ -178,7 +184,7 @@ def _attn_fwd(
             K_block_ptr,
             V_block_ptr,
             block_index_q,
-            factor,
+            softmax_factor,
             BLOCK_SIZE_Q,
             BLOCK_SIZE_KV,
             4 - STAGE,
@@ -187,8 +193,9 @@ def _attn_fwd(
             SEQ_LEN,
         )
 
+    # The reason we don't fuse the for loop to the left of the diagonal with the one exactly on the diagonal for the causal attention is to optimize the pipelining that Triton does.
     if STAGE == 3:
-        # For causal attention only: This step runs for the blocks in which there is transition between nn-masked and masked keys
+        # For causal attention only: This step runs for the blocks in the diagonal, in which there is transition between nn-masked and masked keys
         O_block, l_i, m_i = _attn_fwd_inner(
             O_block,
             l_i,
@@ -197,7 +204,7 @@ def _attn_fwd(
             K_block_ptr,
             V_block_ptr,
             block_index_q,
-            factor,
+            softmax_factor,
             BLOCK_SIZE_Q,
             BLOCK_SIZE_KV,
             2,
@@ -205,6 +212,17 @@ def _attn_fwd(
             key_values_offsets,
             SEQ_LEN,
         )
+
+        # Broadcasting so it's done element wise just like with a diag matrix
+        O_block = O_block / l_i[:, None]
+
+        # Pointer to the correct L block. We need to skip by SEQ_LEN for each head in each batch and by query_offsets to select the correct tokens for the current query block.
+        L_block_ptr = L + index_batch_head * SEQ_LEN + query_offsets
+
+        # logsumexp for the backward pass
+        tl.store(L_block_ptr, m_i + tl.math.log(l_i))
+        # Save O_block to the correct location pointed to by O_block_ptr
+        tl.store(O_block_ptr, O_block.to(O.type.element_ty))
 
 
 # Triton kernel for the inner loop of the forward pass of Flash Attention
@@ -217,7 +235,7 @@ def _attn_fwd_inner(
     K_block_ptr,
     V_block_ptr,
     block_index_q,
-    factor,
+    softmax_factor,
     BLOCK_SIZE_Q: tl.constexpr,
     BLOCK_SIZE_KV: tl.constexpr,
     STAGE: tl.constexpr,
@@ -225,14 +243,72 @@ def _attn_fwd_inner(
     key_values_offsets: tl.constexpr,
     SEQ_LEN: tl.constexpr,
 ):
-    # range of values handled by this stage
+    # lower and higher index of the key blocks that we should work with
     if STAGE == 1:
-        # From 0 to the left of the diagonal
-        lo, hi = 0, block_index_q * BLOCK_SIZE_Q
+        # Only for causal attention, we consider the key blocks on the left of the diagonal
+        lower, higher = 0, block_index_q * BLOCK_SIZE_Q
     elif STAGE == 2:
-        # Used only for the block in which there is transition between non-masked and masked keys
-        lo, hi = block_index_q * BLOCK_SIZE_Q, (block_index_q + 1) * BLOCK_SIZE_Q
-        lo = tl.multiple_of(lo, BLOCK_SIZE_Q)
+        # Only for causal attention, we consider the key blocks in which there is transition between non-masked and masked keys (so in the diagonal)
+        lower, higher = block_index_q * BLOCK_SIZE_Q, (block_index_q + 1) * BLOCK_SIZE_Q
+        lower = tl.multiple_of(lower, BLOCK_SIZE_Q)
     else:
-        # Only used for non-causal attention
-        lo, hi = 0, SEQ_LEN
+        # Only for non-causal attention, we consider all the key blocks
+        lower, higher = 0, SEQ_LEN
+
+    # Adjust the pointer to the correct block
+    K_block_ptr = tl.advance(
+        K_block_ptr, (0, lower)
+    )  # offset is inverted because K is transposed
+    V_block_ptr = tl.advance(V_block_ptr, (lower, 0))
+
+    # LOOP over all the keys and values blocks and store inside the accumulator: O_block
+
+    for start_kv in range(lower, higher, BLOCK_SIZE_KV):
+        # Let the compiler know that start_kv is a multiple of BLOCK_SIZE_KV, so the compiler can do optimization
+        start_kv = tl.multiple_of(start_kv, BLOCK_SIZE_KV)
+
+        # load the K block in SRAM and compute the dot product
+        K_block = tl.load(K_block_ptr)
+        # (BLOCK_SIZE_Q, BLOCK_SIZE_KV)
+        QK_block = tl.dot(Q_block, K_block)
+
+        if STAGE == 2:
+            # Build the causal mask for the QK_block
+            mask = query_offsets[:, None] >= (start_kv + key_values_offsets[None, :])
+            # # Apply causal mask by adding -1.0e6 to masked positions (upper triangle)
+            QK_block = QK_block * softmax_factor + tl.where(mask, 0, -1.0e6)
+            # max per row for stability (log-sum-exp trick)
+            m_ij = tl.maximum(m_i, tl.max(QK_block, 1))
+            # subtracting the row-wise max for numerical stability
+            QK_block -= m_ij[:, None]
+        else:
+            # compute the maximum value of qk or keep the old max value
+            m_ij = tl.maximum(m_i, tl.max(QK_block, 1) * softmax_factor)
+            QK_block = QK_block * product - m_ij[:, None]
+
+        # exp(qk_ij - m_i)
+        P_block = tl.math.exp(QK_block)
+
+        # Correction factor
+        cor_fact = tl.math.exp(m_i - m_ij)
+
+        # Apply correction factor to the previous l_i and add the new l_ij
+        l_i = cor_fact * l_i + tl.sum(P_block, 1)
+
+        # load the V block on SRAM
+        V_block = tl.load(V_block_ptr)
+
+        # Is it really needed ?
+        P_block = P_block.to(tl.float16)
+
+        # Compute the new O_block
+        O_block = O_block * cor_fact[:, None] + tl.dot(P_block, V_block)
+
+        # update the maximum tensor
+        m_i = m_ij
+
+        # Move the pointers to the next K and V blocks
+        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_SIZE_KV, 0))
+        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_SIZE_KV))
+
+    return O_block, l_i, m_i
