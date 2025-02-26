@@ -5,7 +5,7 @@ import triton.language as tl
 from flash_attention import FlashAttention
 from multi_head_attention import MultiHeadAttention
 
-############################### Test Function ###############################
+###################################### Test Function ######################################
 
 
 def test(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float16):

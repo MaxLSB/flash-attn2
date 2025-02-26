@@ -8,8 +8,9 @@ import triton.language as tl
 # Flash Attention for Sliding Window
 # Multi-Head Latent Flash Attention
 # GQA Flash Attention
+# Native Sparse Attention with Flash Attention !!
 
-############################### Flash Attention Forward/Backward pass ###############################
+###################################### Flash Attention Class ######################################
 
 
 class FlashAttention(torch.autograd.Function):
@@ -25,6 +26,8 @@ class FlashAttention(torch.autograd.Function):
 
         # We make sure the HEAD_DIM for Q, K and V are the same.
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
+        # Self-Attention so the strides should be the same
+        assert Q.stride() == K.stride() == V.stride() == O.stride()
 
         # Tensor where we will store the output
         O = torch.empty_like(Q)
@@ -61,7 +64,7 @@ class FlashAttention(torch.autograd.Function):
             BATCH_SIZE=Q.shape[0],
             NUM_HEADS=Q.shape[1],
             SEQ_LEN=Q.shape[2],
-            HEAD_DIM=HEAD_DIM_K,
+            HEAD_DIM=HEAD_DIM,
             STAGE=stage,
         )
 
@@ -69,9 +72,98 @@ class FlashAttention(torch.autograd.Function):
         ctx.grid = grid
         ctx.softmax_factor = softmax_factor
         ctx.causal = causal
-        ctx.HEAD_DIM = HEAD_DIM_K
 
         return 0
+
+    @staticmethod
+    def backward(ctx, dO):
+        Q, K, V, O, L = ctx.save_tensors
+
+        assert dO.is_contiguous()
+        assert Q.stride() == K.stride() == V.stride() == O.stride() == dO.stride()
+
+        dQ = torch.empty_like(Q)
+        dV = torch.empty_like(V)
+        dK = torch.empty_like(K)
+
+        BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM = Q.shape
+        NUM_WARPS, NUM_STAGES = 4, 3
+        BLOCK_SIZE_MICRO, BLOCK_SIZE_MACRO = 32, 128
+
+        preprocess_grid = (SEQ_LEN // BLOCK_SIZE_MACRO, BATCH_SIZE * NUM_HEADS)
+        # (BATCH_SIZE, NUM_HEADS, SEQ_LEN)
+        D = torch.empty_like(L)
+
+        # Compute all the D_i elements
+        _attn_bwd_preprocess[preprocess_grid](
+            O=O,
+            dO=dO,
+            D=D,
+            SEQ_LEN=SEQ_LEN,
+            BLOCK_SIZE_Q=BLOCK_SIZE_MACRO,
+            HEAD_DIM=HEAD_DIM,
+        )
+
+        # First Dim (X): The number of K, V blocks we will have
+        # Second Dim (Y): Which head of which batch element we are going to work with
+        grid = (SEQ_LEN // BLOCK_SIZE_MACRO, BATCH_SIZE * NUM_HEADS, 1)
+
+        stage = 3 if ctx.causal else 1
+
+        # K, V blocks are fixed, we itterate through all the Q blocks
+        _attn_bwd_dk_dv[grid](
+            Q=Q,
+            K=K,
+            V=V,
+            dO=dO,
+            dQ=dQ,
+            dK=dK,
+            dV=dV,
+            L=L,
+            D=D,
+            stride_batch=Q.stride(0),
+            stride_head=Q.stride(1),
+            stride_seq=Q.stride(2),
+            stride_dim=Q.stride(3),
+            NUM_HEADS=NUM_HEADS,
+            SEQ_LEN=SEQ_LEN,
+            BLOCK_Q=BLOCK_SIZE_MICRO,
+            BLOCK_KV=BLOCK_SIZE_MACRO,
+            HEAD_DIM=HEAD_DIM,
+            STAGE=stage,
+            num_warps=NUM_WARPS,
+            num_stages=NUM_STAGES,
+        )
+
+        # Q block is fixed, we iterate through all the K, V blocks
+        _attn_bwd_dq[grid](
+            Q=Q,
+            K=K,
+            V=V,
+            dO=dO,
+            dQ=dQ,
+            dK=dK,
+            dV=dV,
+            L=L,
+            D=D,
+            stride_batch=Q.stride(0),
+            stride_head=Q.stride(1),
+            stride_seq=Q.stride(2),
+            stride_dim=Q.stride(3),
+            NUM_HEADS=NUM_HEADS,
+            SEQ_LEN=SEQ_LEN,
+            BLOCK_Q=BLOCK_SIZE_MACRO,
+            BLOCK_KV=BLOCK_SIZE_MICRO,
+            HEAD_DIM=HEAD_DIM,
+            STAGE=stage,
+            num_warps=NUM_WARPS,
+            num_stages=NUM_STAGES,
+        )
+
+        return dQ, dK, dV, None, None
+
+
+###################################### Forward Pass Triton kernels ######################################
 
 
 # Triton kernel for the forward pass of Flash Attention
@@ -298,11 +390,12 @@ def _attn_fwd_inner(
         # load the V block on SRAM
         V_block = tl.load(V_block_ptr)
 
-        # Is it really needed ?
         P_block = P_block.to(tl.float16)
 
         # Compute the new O_block
-        O_block = O_block * cor_fact[:, None] + tl.dot(P_block, V_block)
+        O_block = O_block * cor_fact[:, None]
+        # O_block is an accumulator. It is more efficient
+        O_block = tl.dot(P_block, V_block, O_block)
 
         # update the maximum tensor
         m_i = m_ij
@@ -312,3 +405,77 @@ def _attn_fwd_inner(
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_SIZE_KV))
 
     return O_block, l_i, m_i
+
+
+###################################### Backward Pass Triton kernels ######################################
+
+
+# Triton kernel for the preprocessing step of the backward pass of Flash Attention
+@triton.jit
+def _attn_bwd_preprocess(
+    O, dO, D, SEQ_LEN, BLOCK_SIZE_Q: tl.constexpr, HEAD_DIM: tl.constexpr
+):
+    # Index of the block in the sequence length to process
+    block_index_q = tl.program_id(0)
+    # Index representing the combination of batch and head to process. Each program handles one head in one batch.
+    index_batch_head = tl.program_id(1)
+
+    # array of indices which represent the offsets for the tokens in Q to process
+    query_offsets = block_index_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+
+    # array of indices which represent the offsets on dimension. We need to load all the dimensions.
+    dim_offsets = tl.arange(0, HEAD_DIM)
+
+    # We load the O_block with the correct pointer (could also be done with tl.make_block_ptr()) -> (BLOCK_SIZE_Q, HEAD_DIM)
+    # O: (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM)
+    O_block = tl.load(
+        O
+        + index_batch_head * SEQ_LEN * HEAD_DIM
+        + query_offsets[:, None] * HEAD_DIM
+        + dim_offsets[None, :]
+    )
+
+    # We load a single block -> (BLOCK_SIZE_Q, HEAD_DIM)
+    dO_block = tl.load(
+        dO
+        + +index_batch_head * SEQ_LEN * HEAD_DIM
+        + query_offsets[:, None] * HEAD_DIM
+        + dim_offsets[None, :]
+    ).to(tl.float32)
+
+    # Compute the D block -> (BLOCK_SIZE_Q,)
+    D_block = tl.sum(dO_block * O_block, axis=1)
+    D_block_ptrs = D + index_batch_head * SEQ_LEN + query_offsets
+
+    tl.store(D_block_ptrs, D_block)
+
+
+@triton.jit
+def _attn_bwd_dk_dv(
+    Q,
+    K,
+    V,
+    dO,
+    dQ,
+    dK,
+    dV,
+    L,
+    D,
+    stride_batch,
+    stride_head,
+    stride_seq,
+    stride_dim,
+    NUM_HEADS,
+    SEQ_LEN,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    STAGE: tl.constexpr,
+):
+    index_batch_head = tl.program_id(1)
+    index_batch = index_batch_head // NUM_HEADS
+    index_head = index_batch_head % NUM_HEADS
+    offset_batch_head = (stride_batch * index_batch + index_head * stride_head).to(
+        tl.int64
+    )
+    offset_batch_head_seq = (offset_batch_head * SEQ_LEN).to(tl.int64)
