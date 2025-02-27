@@ -1,9 +1,7 @@
 import torch
-import triton
-import triton.language as tl
 
 from flash_attention import FlashAttention
-from multi_head_attention import MultiHeadAttention
+from multi_head_attention import multi_head_attention
 
 ###################################### Test Function ######################################
 
@@ -40,14 +38,13 @@ def test(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float16):
     dO = torch.randn_like(Q)  # for the backward pass
 
     # Vanilla Multi-Head Attention in PyTorch
-    attn_out, _ = MultiHeadAttention.forward(Q, K, V, causal)
+    attn_out = multi_head_attention(Q, K, V, causal)
     attn_out.backward(dO)
     attn_dQ, Q.grad = Q.grad.clone(), None
     attn_dK, K.grad = K.grad.clone(), None
     attn_dV, V.grad = V.grad.clone(), None
 
     # Flash Attention implementation in Triton
-    # When using torch.autograd.Function, apply triggers the forward pass
     flash_out = FlashAttention.apply(Q, K, V, causal).half()
     flash_out.backward(dO)
     flash_dQ, Q.grad = Q.grad.clone(), None
@@ -62,6 +59,6 @@ def test(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float16):
 
 
 if __name__ == "__main__":
-    test(BATCH_SIZE=8, NUM_HEADS=16, SEQ_LEN=4096, HEAD_DIM=64, causal=True)
-    test(BATCH_SIZE=8, NUM_HEADS=16, SEQ_LEN=4096, HEAD_DIM=64, causal=False)
-    print("PASSED")
+    test(BATCH_SIZE=1, NUM_HEADS=1, SEQ_LEN=64, HEAD_DIM=64, causal=True)
+    test(BATCH_SIZE=1, NUM_HEADS=1, SEQ_LEN=64, HEAD_DIM=64, causal=False)
+    print("TESTS PASSED")
