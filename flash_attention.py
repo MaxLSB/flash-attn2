@@ -14,10 +14,11 @@ import triton.language as tl
 ###################################### Flash Attention Class ######################################
 
 
-class FlashAttention(torch.autograd.Function):
+class FlashAttention2(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, Q, K, V, causal):
+
         # Note: Q, K and V are the matrices after the linear layer in the attention.
         BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM = Q.shape
         HEAD_DIM_Q = Q.shape[-1]
@@ -141,12 +142,6 @@ class FlashAttention(torch.autograd.Function):
             SEQ_LEN=SEQ_LEN,
             HEAD_DIM=HEAD_DIM,
             STAGE=stage,
-        )
-
-        grid = lambda args: (
-            triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]),
-            BATCH_SIZE * NUM_HEADS,
-            1,
         )
 
         # Q block is fixed, we iterate through all the K, V blocks -> compute dQ
@@ -330,16 +325,16 @@ def _attn_fwd(
             SEQ_LEN,
         )
 
-        # Broadcasting so it's done element wise just like with a diag matrix
-        O_block = O_block / l_i[:, None]
+    # Broadcasting so it's done element wise just like with a diag matrix
+    O_block = O_block / l_i[:, None]
 
-        # Pointer to the correct L block. We need to skip by SEQ_LEN for each head in each batch and by q_offsets to select the correct tokens for the current query block.
-        L_block_ptr = L + index_batch_head * SEQ_LEN + q_offsets
+    # Pointer to the correct L block. We need to skip by SEQ_LEN for each head in each batch and by q_offsets to select the correct tokens for the current query block.
+    L_block_ptr = L + index_batch_head * SEQ_LEN + q_offsets
 
-        # logsumexp for the backward pass
-        tl.store(L_block_ptr, m_i + tl.math.log(l_i))
-        # Save O_block to the correct location pointed to by O_block_ptr
-        tl.store(O_block_ptr, O_block.to(O.type.element_ty))
+    # logsumexp for the backward pass
+    tl.store(L_block_ptr, m_i + tl.math.log(l_i))
+    # Save O_block to the correct location pointed to by O_block_ptr
+    tl.store(O_block_ptr, O_block.to(O.type.element_ty))
 
 
 # Triton kernel for the inner loop of the forward pass of Flash Attention
@@ -488,20 +483,21 @@ def _attn_bwd_preprocess(
     tl.store(D_block_ptrs, D_block)
 
 
-@triton.autotune(
-    [
-        triton.Config(
-            {"BLOCK_SIZE_Q": BLOCK_SIZE_Q, "BLOCK_SIZE_KV": BLOCK_SIZE_KV},
-            num_stages=num_stages,
-            num_warps=num_warps,
-        )
-        for BLOCK_SIZE_KV in [64, 128]
-        for BLOCK_SIZE_Q in [32, 64]
-        for num_stages in ([3, 4, 7])
-        for num_warps in [2, 4]
-    ],
-    key=["SEQ_LEN", "HEAD_DIM"],
-)
+# Setting the config for autotune. Issue when giving different block size for Q and KV  (need to be solved)
+configs = [
+    triton.Config(
+        {"BLOCK_SIZE_Q": BLOCK_SIZE_Q, "BLOCK_SIZE_KV": BLOCK_SIZE_KV},
+        num_stages=num_stages,
+        num_warps=num_warps,
+    )
+    for BLOCK_SIZE_Q in [64]
+    for BLOCK_SIZE_KV in [64]
+    for num_stages in ([3, 4, 7])
+    for num_warps in [2, 4]
+]
+
+
+@triton.autotune(configs, key=["SEQ_LEN", "HEAD_DIM"])
 @triton.jit
 def _attn_bwd_dk_dv(
     Q,
@@ -525,6 +521,7 @@ def _attn_bwd_dk_dv(
     BLOCK_SIZE_KV: tl.constexpr,
     STAGE: tl.constexpr,
 ):
+
     # Index representing the combination of batch and head to process
     index_batch_head = tl.program_id(1)
     index_batch = index_batch_head // NUM_HEADS
@@ -532,12 +529,13 @@ def _attn_bwd_dk_dv(
     offset_batch_head = (stride_batch * index_batch + index_head * stride_head).to(
         tl.int64
     )
-    offset_batch_head_seq = (offset_batch_head * SEQ_LEN).to(tl.int64)
+    offset_batch_head_seq = (index_batch_head * SEQ_LEN).to(tl.int64)
 
     # put the pointers are the right place for the current batch and head
     Q += offset_batch_head
     K += offset_batch_head
     V += offset_batch_head
+    dO += offset_batch_head
     dQ += offset_batch_head
     dV += offset_batch_head
     dK += offset_batch_head
@@ -616,7 +614,7 @@ def _attn_bwd_dk_dv(
         dS_T_block = dS_T_block.to(tl.float16)
 
         # We accumulate the dot product in dK_block
-        dK_block = softmax_factor * tl.dot(dS_T_block, tl.trans(Q_T_block))
+        dK_block += softmax_factor * tl.dot(dS_T_block, tl.trans(Q_T_block))
 
         # Note: tl.advance is usable only if the pointer was created using tl.make_ptr (not the case here)
         # Update the pointers
@@ -636,20 +634,7 @@ def _attn_bwd_dk_dv(
     tl.store(dK_block_ptrs, dK_block)
 
 
-@triton.autotune(
-    [
-        triton.Config(
-            {"BLOCK_SIZE_Q": BLOCK_SIZE_Q, "BLOCK_SIZE_KV": BLOCK_SIZE_KV},
-            num_stages=num_stages,
-            num_warps=num_warps,
-        )
-        for BLOCK_SIZE_Q in [64, 128]
-        for BLOCK_SIZE_KV in [32, 64]
-        for num_stages in ([3, 4, 7])
-        for num_warps in [2, 4]
-    ],
-    key=["SEQ_LEN", "HEAD_DIM"],
-)
+@triton.autotune(configs, key=["SEQ_LEN", "HEAD_DIM"])
 @triton.jit
 def _attn_bwd_dq(
     Q,
@@ -673,14 +658,15 @@ def _attn_bwd_dq(
     BLOCK_SIZE_KV: tl.constexpr,
     STAGE: tl.constexpr,
 ):
+
     # Index representing the combination of batch and head to process
-    index_batch_head = tl.program_id(2)
+    index_batch_head = tl.program_id(1)
     index_batch = index_batch_head // NUM_HEADS
     index_head = index_batch_head % NUM_HEADS
     offset_batch_head = (index_batch * stride_batch + index_head * stride_head).to(
         tl.int64
     )
-    offset_batch_head_seq = (offset_batch_head * SEQ_LEN).to(tl.int64)
+    offset_batch_head_seq = (index_batch_head * SEQ_LEN).to(tl.int64)
 
     # put the pointers are the right place for the current batch and head
     Q += offset_batch_head
@@ -689,7 +675,7 @@ def _attn_bwd_dq(
     dQ += offset_batch_head
     dV += offset_batch_head
     dK += offset_batch_head
-    dO += offset_batch_head_seq
+    dO += offset_batch_head
 
     # put the pointers are the right place for the current batch, head and sequence
     L += offset_batch_head_seq
