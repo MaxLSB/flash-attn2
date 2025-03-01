@@ -2,10 +2,17 @@
 
 _Work in progress..._
 
-Implementation of Flash Attention for self-attention in Triton. Supports both the forward and backward passes for causal and non-causal cases.
+Implementation of Flash Attention for self-attention in Triton. 
+
+Currently supporting:
+- Forward pass
+- Backward passe
+- Causal Attention
+- Global Attention
+- Sliding Window Attention (Still working on it...)
 
 
-Other ideas:
+<!-- Other ideas:
 - Multi-Head Latent Flash Attention
 - GQA Flash Attention
-- Native Sparse Attention with Flash Attention
+- Native Sparse Attention with Flash Attention -->

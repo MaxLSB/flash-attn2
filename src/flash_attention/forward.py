@@ -11,8 +11,8 @@ import triton.language as tl
             num_stages=num_stages,
             num_warps=num_warps,
         )
-        for BLOCK_SIZE_Q in [32]
-        for BLOCK_SIZE_KV in [32]
+        for BLOCK_SIZE_Q in [32, 64]
+        for BLOCK_SIZE_KV in [32, 64]
         for num_stages in ([3, 4, 7])
         for num_warps in [2, 4]
     ],
@@ -310,16 +310,14 @@ def _attn_fwd_inner(
             # Blocks on the left of the middle diagonal
             lower, higher = 0, block_index_q * BLOCK_SIZE_Q
 
-        else:
+        elif STAGE == 2:
             # Blocks in the diagonal, where there is transition between non-masked and masked keys
-            lower, higher = (
-                block_index_q * BLOCK_SIZE_Q,
-                (block_index_q + 1) * BLOCK_SIZE_Q,
-            )
+            lower = block_index_q * BLOCK_SIZE_Q
+            higher = (block_index_q + 1) * BLOCK_SIZE_Q
             lower = tl.multiple_of(lower, BLOCK_SIZE_Q)
 
-    elif MODE == 3:  # Sliding Window
-        # Get the correct window block index for the sliding window
+    elif MODE == 2:  # Sliding Window
+        # Compute the number of blocks to attend on each side of the main diagonal
         if WINDOW_SIZE and WINDOW_SIZE > BLOCK_SIZE_Q:
             window_block_index = triton.cdiv(
                 WINDOW_SIZE - BLOCK_SIZE_Q, 2 * BLOCK_SIZE_Q
@@ -327,31 +325,26 @@ def _attn_fwd_inner(
         else:
             window_block_index = 0
 
-        # Example 1:
-        # BLOCK_SIZE_Q = 5
-        # WINDOW_SIZE = 16
-        # 1 | 5 | 5 | 5 | 0
-        # window_block_index = 2
-        # mask_window_size_left = 1
-        # mask_window_size_right = 0
-
-        mask_window_size_left = ((WINDOW_SIZE - BLOCK_SIZE_Q + 1) // 2) % BLOCK_SIZE_Q
-        mask_window_size_right = ((WINDOW_SIZE - BLOCK_SIZE_Q) // 2) % BLOCK_SIZE_Q
-
         if STAGE == 1:
             # Blocks in between the right and left diagonals
-            lower = (block_index_q - (window_block_index + 1)) * BLOCK_SIZE_Q
+            lower = (block_index_q - window_block_index + 1) * BLOCK_SIZE_Q
             higher = (block_index_q + window_block_index) * BLOCK_SIZE_Q
 
         elif STAGE == 2:
             # Blocks in the right diagonal, where there is transition between non-masked and masked keys
-            lower = (block_index_q + window_block_index) * BLOCK_SIZE_Q
-            higher = (block_index_q + (window_block_index + 1)) * BLOCK_SIZE_Q
+            if block_index_q + window_block_index < triton.cdiv(SEQ_LEN, BLOCK_SIZE_Q):
+                lower = (block_index_q + window_block_index) * BLOCK_SIZE_Q
+                higher = (block_index_q + window_block_index + 1) * BLOCK_SIZE_Q
+            else:
+                lower, higher = 0, 0
 
         elif STAGE == 3:
             # Blocks in the left diagonal, where there is transition between non-masked and masked keys
-            lower = (block_index_q - window_block_index) * BLOCK_SIZE_Q
-            higher = (block_index_q - (window_block_index + 1)) * BLOCK_SIZE_Q
+            if block_index_q >= window_block_index:
+                lower = (block_index_q - window_block_index) * BLOCK_SIZE_Q
+                higher = (block_index_q - window_block_index + 1) * BLOCK_SIZE_Q
+            else:
+                lower, higher = 0, 0
 
         lower = tl.multiple_of(lower, BLOCK_SIZE_Q)
         higher = tl.multiple_of(higher, BLOCK_SIZE_Q)
@@ -384,8 +377,16 @@ def _attn_fwd_inner(
             S_block -= m_ij[:, None]
 
         # ! TAKE CARE OF THE CASE WHERE WINDOW_SIZE < BLOCK_SIZE_Q !
+        # ! Probably the issue from Sliding Window come from here
+        # ! mask_window_size_left and mask_window_size_right might not be correct
+        # ! The offset might not be correct when computing the mask
 
         elif MODE == 2 and STAGE != 1:  # Sliding Window - Stage 2, 3
+            mask_window_size_left = (
+                (WINDOW_SIZE - BLOCK_SIZE_Q + 1) // 2
+            ) % BLOCK_SIZE_Q
+            mask_window_size_right = ((WINDOW_SIZE - BLOCK_SIZE_Q) // 2) % BLOCK_SIZE_Q
+
             if STAGE == 2:  # Right diagonal so the upper triangle part is masked
                 # TRUE for the valid tokens
                 mask = q_offsets[:, None] - BLOCK_SIZE_Q + mask_window_size_right >= (

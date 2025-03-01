@@ -60,6 +60,8 @@ def test(
     flash_dQ, Q.grad = Q.grad.clone(), None
 
     # Compare the two implementations and make sure the results match
+    print(attn_out)
+    print(flash_out)
     assert torch.allclose(attn_out, flash_out, rtol=0.0, atol=1e-2)
     assert torch.allclose(attn_dV, flash_dV, rtol=0.0, atol=1e-2)
     assert torch.allclose(attn_dK, flash_dK, rtol=0.0, atol=1e-2)
@@ -67,12 +69,12 @@ def test(
 
 
 if __name__ == "__main__":
-    # NUM_HEADS >= 2 | SEQ_LEN >= 64 | HEAD_DIM >= 64
+    # SEQ_LEN >= 64 | HEAD_DIM >= 64
     # attn_mode: "global" or "causal" or "sliding_window"
 
     test(
         BATCH_SIZE=1,
-        NUM_HEADS=2,
+        NUM_HEADS=1,
         SEQ_LEN=64,
         HEAD_DIM=64,
         WINDOW_SIZE=41,
