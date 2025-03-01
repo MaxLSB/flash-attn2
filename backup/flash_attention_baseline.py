@@ -2,14 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
-# Self-Attention only with both the causal and non-causal cases.
-# No dropout in this implementation
-# Flash-bidirectional-attention & Flash-causal-attention
-# Change the STAGE system
-# Flash Attention for Sliding Window
-# Multi-Head Latent Flash Attention
-# GQA Flash Attention
-# Native Sparse Attention with Flash Attention !!
+
+# DO NOT TOUCH FOR NOW !!!!!!!!!!!!!!!!!!!!!!!
 
 ###################################### Flash Attention Class ######################################
 
@@ -31,7 +25,8 @@ class FlashAttention2(torch.autograd.Function):
 
         # Tensor where we will store the output
         O = torch.empty_like(Q)
-        stage = 3 if causal else 1  # Causal or not causal
+
+        stage = 1 if causal else 0  # Causal or not causal
 
         # First Dim (X): Which group of queries are we going to work with. How many blocks of Q we have.
         # Second Dim (Y): Which head of which batch element we are going to work with
@@ -244,7 +239,7 @@ def _attn_fwd(
         order=(1, 0),
     )
     # Pointer to the current K block: K[index_batch, index_head, :, :]
-    K_block_ptr = tl.make_block_ptr(
+    K_T_block_ptr = tl.make_block_ptr(
         base=K + qvk_start,
         shape=(HEAD_DIM, SEQ_LEN),
         strides=(
@@ -284,42 +279,59 @@ def _attn_fwd(
     # load the Q block in SRAM
     Q_block = tl.load(Q_block_ptr)
 
-    # STAGE = 3 if causal | STAGE = 1 if non-causal
-    if STAGE == 1 or STAGE == 3:
-        # For non-causal attention: This steps runs all the blocks.
-        # For causal attention: This steps runs the blocks to the left of the diagonal
+    # STAGE = 1 if causal | STAGE = 0 if non-causal
+
+    # The reason we don't fuse the for loop to the left of the diagonal with the one exactly on the diagonal for the causal attention is to optimize the pipelining that Triton does.
+    if STAGE == 1:  # Causal attention
+        # This steps runs the blocks to the left of the diagonal
         O_block, l_i, m_i = _attn_fwd_inner(
             O_block,
             l_i,
             m_i,
             Q_block,
-            K_block_ptr,
+            K_T_block_ptr,
             V_block_ptr,
             block_index_q,
             softmax_factor,
             BLOCK_SIZE_Q,
             BLOCK_SIZE_KV,
-            4 - STAGE,
+            STAGE,
+            q_offsets,
+            kv_offsets,
+            SEQ_LEN,
+        )
+        # This step runs for the blocks in the diagonal, in which there is transition between nn-masked and masked keys
+        O_block, l_i, m_i = _attn_fwd_inner(
+            O_block,
+            l_i,
+            m_i,
+            Q_block,
+            K_T_block_ptr,
+            V_block_ptr,
+            block_index_q,
+            softmax_factor,
+            BLOCK_SIZE_Q,
+            BLOCK_SIZE_KV,
+            STAGE + 1,
             q_offsets,
             kv_offsets,
             SEQ_LEN,
         )
 
-    # The reason we don't fuse the for loop to the left of the diagonal with the one exactly on the diagonal for the causal attention is to optimize the pipelining that Triton does.
-    if STAGE == 3:
-        # For causal attention only: This step runs for the blocks in the diagonal, in which there is transition between nn-masked and masked keys
+    if STAGE == 0:  # Non-causal attention
+        # This steps runs all the blocks.
         O_block, l_i, m_i = _attn_fwd_inner(
             O_block,
             l_i,
             m_i,
             Q_block,
-            K_block_ptr,
+            K_T_block_ptr,
             V_block_ptr,
             block_index_q,
             softmax_factor,
             BLOCK_SIZE_Q,
             BLOCK_SIZE_KV,
-            2,
+            STAGE,
             q_offsets,
             kv_offsets,
             SEQ_LEN,
@@ -344,7 +356,7 @@ def _attn_fwd_inner(
     l_i,
     m_i,
     Q_block,
-    K_block_ptr,
+    K_T_block_ptr,
     V_block_ptr,
     block_index_q,
     softmax_factor,
@@ -356,20 +368,22 @@ def _attn_fwd_inner(
     SEQ_LEN: tl.constexpr,
 ):
     # lower and higher index of the key blocks that we should work with
-    if STAGE == 1:
-        # Only for causal attention, we consider the key blocks on the left of the diagonal
+    if STAGE == 0:
+        # For non-causal attention, we consider all the key blocks
+        lower, higher = 0, SEQ_LEN
+    elif STAGE == 1:
+        # For causal attention, we consider the key blocks on the left of the diagonal
         lower, higher = 0, block_index_q * BLOCK_SIZE_Q
     elif STAGE == 2:
-        # Only for causal attention, we consider the key blocks in which there is transition between non-masked and masked keys (so in the diagonal)
+        # For causal attention, we consider the key blocks in which there is transition between non-masked and masked keys (so in the diagonal)
         lower, higher = block_index_q * BLOCK_SIZE_Q, (block_index_q + 1) * BLOCK_SIZE_Q
         lower = tl.multiple_of(lower, BLOCK_SIZE_Q)
     else:
-        # Only for non-causal attention, we consider all the key blocks
-        lower, higher = 0, SEQ_LEN
+        raise ValueError(f"Invalid STAGE value: {STAGE}.")
 
     # Adjust the pointer to the correct block
-    K_block_ptr = tl.advance(
-        K_block_ptr, (0, lower)
+    K_T_block_ptr = tl.advance(
+        K_T_block_ptr, (0, lower)
     )  # offset is inverted because K is transposed
     V_block_ptr = tl.advance(V_block_ptr, (lower, 0))
 
@@ -380,26 +394,26 @@ def _attn_fwd_inner(
         start_kv = tl.multiple_of(start_kv, BLOCK_SIZE_KV)
 
         # load the K block in SRAM and compute the dot product
-        K_block = tl.load(K_block_ptr)
+        K_T_block = tl.load(K_T_block_ptr)
         # (BLOCK_SIZE_Q, BLOCK_SIZE_KV)
-        QK_block = tl.dot(Q_block, K_block)
+        S_block = tl.dot(Q_block, K_T_block)
 
-        if STAGE == 2:
-            # Build the causal mask for the QK_block
+        if STAGE == 2:  # For the diagonal blocks
+            # Build the causal mask for the S_block
             mask = q_offsets[:, None] >= (start_kv + kv_offsets[None, :])
             # # Apply causal mask by adding -1.0e6 to masked positions (upper triangle)
-            QK_block = QK_block * softmax_factor + tl.where(mask, 0, -1.0e6)
+            S_block = S_block * softmax_factor + tl.where(mask, 0, -1.0e6)
             # max per row for stability (log-sum-exp trick)
-            m_ij = tl.maximum(m_i, tl.max(QK_block, 1))
+            m_ij = tl.maximum(m_i, tl.max(S_block, 1))
             # subtracting the row-wise max for numerical stability
-            QK_block -= m_ij[:, None]
+            S_block -= m_ij[:, None]
         else:
             # compute the maximum value of qk or keep the old max value
-            m_ij = tl.maximum(m_i, tl.max(QK_block, 1) * softmax_factor)
-            QK_block = QK_block * softmax_factor - m_ij[:, None]
+            m_ij = tl.maximum(m_i, tl.max(S_block, 1) * softmax_factor)
+            S_block = S_block * softmax_factor - m_ij[:, None]
 
         # exp(qk_ij - m_i)
-        P_block = tl.math.exp(QK_block)
+        P_block = tl.math.exp(S_block)
 
         # Correction factor
         cor_fact = tl.math.exp(m_i - m_ij)
@@ -422,7 +436,7 @@ def _attn_fwd_inner(
 
         # Move the pointers to the next K and V blocks
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_SIZE_KV, 0))
-        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_SIZE_KV))
+        K_T_block_ptr = tl.advance(K_T_block_ptr, (0, BLOCK_SIZE_KV))
 
     return O_block, l_i, m_i
 
@@ -490,8 +504,8 @@ configs = [
         num_stages=num_stages,
         num_warps=num_warps,
     )
-    for BLOCK_SIZE_Q in [64]
-    for BLOCK_SIZE_KV in [64]
+    for BLOCK_SIZE_Q in [32]
+    for BLOCK_SIZE_KV in [32]
     for num_stages in ([3, 4, 7])
     for num_warps in [2, 4]
 ]
