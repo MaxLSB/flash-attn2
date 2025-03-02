@@ -317,6 +317,8 @@ def _attn_fwd_inner(
             lower = tl.multiple_of(lower, BLOCK_SIZE_Q)
 
     elif MODE == 2:  # Sliding Window
+
+        # ! is it really computed the correct way ?
         # Compute the number of blocks to attend on each side of the main diagonal
         if WINDOW_SIZE and WINDOW_SIZE > BLOCK_SIZE_Q:
             window_block_index = triton.cdiv(
@@ -325,26 +327,46 @@ def _attn_fwd_inner(
         else:
             window_block_index = 0
 
+        NUM_BLOCKS_Q = tl.cdiv(SEQ_LEN, BLOCK_SIZE_Q)
+
         if STAGE == 1:
+
+            # ! issue here
+
             # Blocks in between the right and left diagonals
-            lower = (block_index_q - window_block_index + 1) * BLOCK_SIZE_Q
-            higher = (block_index_q + window_block_index) * BLOCK_SIZE_Q
+            if block_index_q == 0:  # Top left Block
+                lower, higher = 0, BLOCK_SIZE_Q
+            elif block_index_q == NUM_BLOCKS_Q - 1:  # Bottom right Block
+                lower, higher = (
+                    NUM_BLOCKS_Q - 1
+                ) * BLOCK_SIZE_Q, NUM_BLOCKS_Q * BLOCK_SIZE_Q
+            else:
+                lower = (max(0, block_index_q - window_block_index) + 1) * BLOCK_SIZE_Q
+                higher = (
+                    min(NUM_BLOCKS_Q - 1, block_index_q + window_block_index) - 1
+                ) * BLOCK_SIZE_Q
 
         elif STAGE == 2:
             # Blocks in the right diagonal, where there is transition between non-masked and masked keys
-            if block_index_q + window_block_index < triton.cdiv(SEQ_LEN, BLOCK_SIZE_Q):
-                lower = (block_index_q + window_block_index) * BLOCK_SIZE_Q
-                higher = (block_index_q + window_block_index + 1) * BLOCK_SIZE_Q
-            else:
+            if block_index_q == NUM_BLOCKS_Q - 1:  # Bottom right Block
                 lower, higher = 0, 0
+            else:
+                lower = (
+                    min(
+                        NUM_BLOCKS_Q - 1,
+                        block_index_q + window_block_index,
+                    )
+                    * BLOCK_SIZE_Q
+                )
+                higher = lower + BLOCK_SIZE_Q
 
         elif STAGE == 3:
             # Blocks in the left diagonal, where there is transition between non-masked and masked keys
-            if block_index_q >= window_block_index:
-                lower = (block_index_q - window_block_index) * BLOCK_SIZE_Q
-                higher = (block_index_q - window_block_index + 1) * BLOCK_SIZE_Q
-            else:
+            if block_index_q == 0:  # Top left Block
                 lower, higher = 0, 0
+            else:
+                lower = max(0, block_index_q - window_block_index) * BLOCK_SIZE_Q
+                higher = lower + BLOCK_SIZE_Q
 
         lower = tl.multiple_of(lower, BLOCK_SIZE_Q)
         higher = tl.multiple_of(higher, BLOCK_SIZE_Q)
@@ -377,24 +399,19 @@ def _attn_fwd_inner(
             S_block -= m_ij[:, None]
 
         # ! TAKE CARE OF THE CASE WHERE WINDOW_SIZE < BLOCK_SIZE_Q !
-        # ! Probably the issue from Sliding Window come from here
-        # ! mask_window_size_left and mask_window_size_right might not be correct
-        # ! The offset might not be correct when computing the mask
 
         elif MODE == 2 and STAGE != 1:  # Sliding Window - Stage 2, 3
-            mask_window_size_left = (
-                (WINDOW_SIZE - BLOCK_SIZE_Q + 1) // 2
-            ) % BLOCK_SIZE_Q
-            mask_window_size_right = ((WINDOW_SIZE - BLOCK_SIZE_Q) // 2) % BLOCK_SIZE_Q
+            half_window_right = (WINDOW_SIZE - 1) // 2
+            half_window_left = WINDOW_SIZE - half_window_right - 1
 
             if STAGE == 2:  # Right diagonal so the upper triangle part is masked
                 # TRUE for the valid tokens
-                mask = q_offsets[:, None] - BLOCK_SIZE_Q + mask_window_size_right >= (
+                mask = q_offsets[:, None] + half_window_right >= (
                     start_kv + kv_offsets[None, :]
                 )
             else:  # Left diagonal so the lower triangle part is masked
                 # TRUE for the valid tokens
-                mask = q_offsets[:, None] + BLOCK_SIZE_Q - mask_window_size_left <= (
+                mask = q_offsets[:, None] - half_window_left <= (
                     start_kv + kv_offsets[None, :]
                 )
 

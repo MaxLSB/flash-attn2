@@ -40,6 +40,7 @@ class FlashAttention(torch.autograd.Function):
         )
         if attn_mode == "sliding_window":
             assert WINDOW_SIZE
+            assert WINDOW_SIZE < SEQ_LEN
 
         # Tensor where we will store the output
         O = torch.empty_like(Q)
