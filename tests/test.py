@@ -77,7 +77,7 @@ if __name__ == "__main__":
         NUM_HEADS=1,
         SEQ_LEN=64,
         HEAD_DIM=64,
-        WINDOW_SIZE=41,
+        WINDOW_SIZE=35,
         attn_mode="sliding_window",
     )
 

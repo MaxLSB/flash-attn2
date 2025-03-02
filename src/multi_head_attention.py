@@ -22,10 +22,11 @@ def multi_head_attention(Q, K, V, WINDOW_SIZE, attn_mode):
         MASK = torch.tril(all_ones)
 
     elif attn_mode == "sliding_window":
-        window_right = (WINDOW_SIZE - 1) // 2
-        window_left = WINDOW_SIZE - 1 - window_right
-        MASK = torch.triu(all_ones, -1 * window_left) * torch.tril(
-            all_ones, window_right
+        # window_right = (WINDOW_SIZE - 1) // 2
+        # window_left = WINDOW_SIZE - 1 - window_right
+        half_window = WINDOW_SIZE // 2
+        MASK = torch.triu(all_ones, -1 * half_window) * torch.tril(
+            all_ones, half_window
         )
 
     # Compute attention scores
