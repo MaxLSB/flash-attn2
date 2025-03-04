@@ -18,7 +18,7 @@ class FlashAttention(torch.autograd.Function):
     - Causal Attention
     - Global Attention
     - Sliding Window Attention
-    - Don't include dropout
+    - No dropout
     - Float16 (Q, K, V, O)
     """
 
@@ -49,7 +49,7 @@ class FlashAttention(torch.autograd.Function):
             mode = 0
         elif attn_mode == "causal":
             mode = 1
-        else:
+        elif attn_mode == "sliding_window":
             mode = 2
 
         # First Dim (X): Which group of queries are we going to work with. How many blocks of Q we have.
@@ -142,7 +142,7 @@ class FlashAttention(torch.autograd.Function):
             mode = 0
         elif ctx.attn_mode == "causal":
             mode = 1
-        else:
+        elif ctx.attn_mode == "sliding_window":
             mode = 2
 
         # Unlike the paper, we do 2 for loops, one to compute dK, dV and the other to compute dQ

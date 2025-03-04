@@ -11,8 +11,8 @@ import triton.language as tl
             num_stages=num_stages,
             num_warps=num_warps,
         )
-        for BLOCK_SIZE_Q in [32]
-        for BLOCK_SIZE_KV in [32]
+        for BLOCK_SIZE_Q in [16]
+        for BLOCK_SIZE_KV in [16]
         for num_stages in ([3, 4, 7])
         for num_warps in [2, 4]
     ],
@@ -40,7 +40,7 @@ def _attn_fwd(
     MODE: tl.constexpr,
 ):
     """
-    Q, K, V, O--> (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM)
+    Q, K, V, O --> (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM)
     L --> (BATCH_SIZE, NUM_HEADS, SEQ_LEN)
     """
 
@@ -122,24 +122,6 @@ def _attn_fwd(
     # load the Q block in SRAM
     Q_block = tl.load(Q_block_ptr)
 
-    args = (
-        O_block,
-        l_i,
-        m_i,
-        Q_block,
-        K_T_block_ptr,
-        V_block_ptr,
-        block_index_q,
-        softmax_factor,
-        BLOCK_SIZE_Q,
-        BLOCK_SIZE_KV,
-        WINDOW_SIZE,
-        q_offsets,
-        kv_offsets,
-        SEQ_LEN,
-        MODE,
-    )
-
     # The reason we don't fuse the for loops to the left of the diagonal with the one exactly on the diagonal
     # for the causal attention is to optimize the pipelining that Triton does (Same for sliding window)
 
@@ -204,7 +186,7 @@ def _attn_fwd(
             2,
         )
 
-    else:  # Sliding Window
+    elif MODE == 2:  # Sliding Window
         # Stage 1: Runs for the blocks in between the two diagonals
         O_block, l_i, m_i = _attn_fwd_inner(
             O_block,
@@ -318,31 +300,54 @@ def _attn_fwd_inner(
 
     elif MODE == 2:  # Sliding Window
         # Compute the number of blocks to attend on each side of the main diagonal
-        window_block_index = triton.cdiv(WINDOW_SIZE - BLOCK_SIZE_Q, 2 * BLOCK_SIZE_Q)
+        half_window = WINDOW_SIZE // 2
+        window_block_right = tl.cdiv(1 + half_window, BLOCK_SIZE_Q)
+        window_block_left = tl.cdiv(half_window, BLOCK_SIZE_Q)
         NUM_BLOCKS_Q = tl.cdiv(SEQ_LEN, BLOCK_SIZE_Q)
+        
+        # ! ISSUES PROBABLY COME FROM THE WAY I HANDLE THE BOTTOM LEFT CORNER BLOCKS
 
         if STAGE == 1:
+            # window_block_right can be greater than window_block_left
+            # if WINDOW_SIZE // 2 == BLOCK_SIZE_Q then issue on the left
+            # car en q = 1, lower = BLOCK_SIZE mais ca devrait être lower = 0
+            # Plus globalement lorsque WINDOW_SIZE // 2 est divisible par BLOCK_SIZE_Q, la left diagonal apparait qu'à partir de q >= block_index_left
+            
             # Blocks in between the right and left diagonals
-            lower = max(0, block_index_q - window_block_index + 1) * BLOCK_SIZE_Q
-            higher = (
-                min(NUM_BLOCKS_Q, block_index_q + window_block_index)
-            ) * BLOCK_SIZE_Q
+            if (block_index_q + 1) * BLOCK_SIZE_Q - 1 - half_window > 0:
+                lower = max(0, block_index_q - window_block_left + 1) * BLOCK_SIZE_Q
+            else:
+                lower = 0
+            
+            if (half_window + 1) % BLOCK_SIZE_Q == 0:
+                higher = min(NUM_BLOCKS_Q, block_index_q + window_block_right) * BLOCK_SIZE_Q
+            else:
+                higher = min(NUM_BLOCKS_Q, block_index_q + window_block_right - 1) * BLOCK_SIZE_Q
 
         elif STAGE == 2:
             # Blocks in the right diagonal, where there is transition between non-masked and masked keys
-            if block_index_q + window_block_index <= NUM_BLOCKS_Q - 1:
-                lower = (block_index_q + window_block_index) * BLOCK_SIZE_Q
+            if (half_window + 1) % BLOCK_SIZE_Q == 0:
+                lower = min(NUM_BLOCKS_Q, block_index_q + window_block_right) * BLOCK_SIZE_Q
+            else:
+                lower = min(NUM_BLOCKS_Q, block_index_q + window_block_right - 1) * BLOCK_SIZE_Q
+            
+            if lower < NUM_BLOCKS_Q * BLOCK_SIZE_Q:
                 higher = lower + BLOCK_SIZE_Q
             else:
-                lower, higher = 0, 0
+                higher = lower
 
         elif STAGE == 3:
             # Blocks in the left diagonal, where there is transition between non-masked and masked keys
-            if block_index_q - window_block_index >= 0:
-                lower = (block_index_q - window_block_index) * BLOCK_SIZE_Q
-                higher = lower + BLOCK_SIZE_Q
+            
+            if (block_index_q + 1) * BLOCK_SIZE_Q - 1 - half_window > 0:
+                higher = max(0, block_index_q - window_block_left + 1) * BLOCK_SIZE_Q
             else:
-                lower, higher = 0, 0
+                higher = 0
+            
+            if higher > 0:
+                lower = higher - BLOCK_SIZE_Q
+            else:
+                lower = higher
 
         lower = tl.multiple_of(lower, BLOCK_SIZE_Q)
         higher = tl.multiple_of(higher, BLOCK_SIZE_Q)
