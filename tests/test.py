@@ -93,7 +93,7 @@ if __name__ == "__main__":
         NUM_HEADS=1,
         SEQ_LEN=128,
         HEAD_DIM=64,
-        WINDOW_SIZE=40,
+        WINDOW_SIZE=120,
         attn_mode="sliding_window",
     )
     print("\nAll Tests: PASSED!\n")

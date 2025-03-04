@@ -302,22 +302,14 @@ def _attn_fwd_inner(
         # Compute the number of blocks to attend on each side of the main diagonal
         half_window = WINDOW_SIZE // 2
         window_block_right = tl.cdiv(1 + half_window, BLOCK_SIZE_Q)
-        window_block_left = tl.cdiv(half_window, BLOCK_SIZE_Q)
         NUM_BLOCKS_Q = tl.cdiv(SEQ_LEN, BLOCK_SIZE_Q)
-        
-        # ! ISSUES PROBABLY COME FROM THE WAY I HANDLE THE BOTTOM LEFT CORNER BLOCKS
 
         if STAGE == 1:
-            # window_block_right can be greater than window_block_left
-            # if WINDOW_SIZE // 2 == BLOCK_SIZE_Q then issue on the left
-            # car en q = 1, lower = BLOCK_SIZE mais ca devrait être lower = 0
-            # Plus globalement lorsque WINDOW_SIZE // 2 est divisible par BLOCK_SIZE_Q, la left diagonal apparait qu'à partir de q >= block_index_left
-            
             # Blocks in between the right and left diagonals
-            if (block_index_q + 1) * BLOCK_SIZE_Q - 1 - half_window > 0:
-                lower = max(0, block_index_q - window_block_left + 1) * BLOCK_SIZE_Q
+            if (half_window + 1) % BLOCK_SIZE_Q == 0:
+                lower = max(0, block_index_q - window_block_right + 1) * BLOCK_SIZE_Q
             else:
-                lower = 0
+                lower = max(0, block_index_q - window_block_right + 2) * BLOCK_SIZE_Q
             
             if (half_window + 1) % BLOCK_SIZE_Q == 0:
                 higher = min(NUM_BLOCKS_Q, block_index_q + window_block_right) * BLOCK_SIZE_Q
@@ -338,11 +330,10 @@ def _attn_fwd_inner(
 
         elif STAGE == 3:
             # Blocks in the left diagonal, where there is transition between non-masked and masked keys
-            
-            if (block_index_q + 1) * BLOCK_SIZE_Q - 1 - half_window > 0:
-                higher = max(0, block_index_q - window_block_left + 1) * BLOCK_SIZE_Q
+            if (half_window + 1) % BLOCK_SIZE_Q == 0:
+                higher = max(0, block_index_q - window_block_right + 1) * BLOCK_SIZE_Q
             else:
-                higher = 0
+                higher = max(0, block_index_q - window_block_right + 2) * BLOCK_SIZE_Q
             
             if higher > 0:
                 lower = higher - BLOCK_SIZE_Q
