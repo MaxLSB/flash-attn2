@@ -10,7 +10,7 @@ import triton.language as tl
         triton.Config(
             {"BLOCK_SIZE": BLOCK_SIZE},
         )
-        for BLOCK_SIZE in [32, 64]
+        for BLOCK_SIZE in [16, 32]
     ],
     key=["SEQ_LEN", "HEAD_DIM"],
 )
@@ -169,16 +169,15 @@ def _attn_bwd_dk_dv(
             # Mask is TRUE for values that do not need to be masked -> (BLOCK_SIZE_KV, BLOCK_SIZE_Q)
             mask_block = q_offsets[None, :] >= kv_offsets[:, None]
             # Replace the masked values with 0
-            # Not needed to mask with -inf before applying softmax as we already computed the normalization factors (stored in 'm')
+            # Not needed to mask with -inf before applying softmax as we already computed the normalization factors (stored in L)
             P_T_block = tl.where(mask_block, P_T_block, 0.0)
 
-        # elif MODE == 2:  # Sliding Window
-        #     left_window = (WINDOW_SIZE - 1) // 2
-        #     right_window = WINDOW_SIZE - 1 - left_window
-        #     mask_block = (kv_offsets[:, None] >= q_offsets[None, :] - left_window) & (
-        #         kv_offsets[:, None] <= q_offsets[None, :] + right_window
-        #     )
-        #     P_T_block = tl.where(mask_block, P_T_block, 0.0)
+        elif MODE == 2:  # Sliding Window
+            half_window = WINDOW_SIZE // 2
+            mask_block = (q_offsets[None, :] + half_window >= kv_offsets[:, None]) & (
+                q_offsets[None, :] - half_window <= kv_offsets[:, None]
+            )
+            P_T_block = tl.where(mask_block, P_T_block, 0.0)
 
         # load dO block
         dO_block = tl.load(dO_ptrs)
@@ -307,7 +306,12 @@ def _attn_bwd_dq(
             P_block = tl.where(mask_block, P_block, 0.0)
 
         elif MODE == 2:  # Sliding Window
-            pass
+            kv_offsets = curr_kv + tl.arange(0, BLOCK_SIZE_KV)
+            half_window = WINDOW_SIZE // 2
+            mask_block = (q_offsets[:, None] + half_window >= kv_offsets[None, :]) & (
+                q_offsets[:, None] - half_window <= kv_offsets[None, :]
+            )
+            P_block = tl.where(mask_block, P_block, 0.0)
 
         # Compute dP and dS
         dP_block = tl.dot(dO_block, V_T_block).to(tl.float32)

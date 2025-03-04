@@ -6,12 +6,14 @@ import torch
 
 def multi_head_attention(Q, K, V, WINDOW_SIZE, attn_mode):
     """
-    Implementation of MultiHead Attention which support:
-    - Causal Attention
+    Implementation of MultiHead Self-Attention:
     - Global Attention
+    - Causal Attention
     - Sliding Window Attention
+    - No dropout
+    - Float16
     """
-    
+
     # Q, K, V are already: (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM)
     _, _, SEQ_LEN, HEAD_DIM = Q.shape
 
@@ -23,13 +25,13 @@ def multi_head_attention(Q, K, V, WINDOW_SIZE, attn_mode):
         MASK = torch.tril(all_ones)
 
     elif attn_mode == "sliding_window":
-        # If WINDOW_SIZE is even, each side of the window has half_window elements  
+        # If WINDOW_SIZE is even, each side of the window has half_window elements
         # If WINDOW_SIZE is odd, the center token is included, so each side still has half_window elements
         half_window = WINDOW_SIZE // 2
         MASK = torch.triu(all_ones, -1 * half_window) * torch.tril(
             all_ones, half_window
         )
-    
+
     # Compute attention scores
     P = torch.matmul(Q, K.transpose(-2, -1)) * softmax_factor
 

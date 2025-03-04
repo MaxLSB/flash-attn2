@@ -15,11 +15,11 @@ class FlashAttention(torch.autograd.Function):
     """
     Flash Attention 2 for Self-Attention which supports:
     - Forward & Backward pass
-    - Causal Attention
     - Global Attention
+    - Causal Attention
     - Sliding Window Attention
     - No dropout
-    - Float16 (Q, K, V, O)
+    - Float16
     """
 
     @staticmethod
@@ -40,7 +40,7 @@ class FlashAttention(torch.autograd.Function):
         )
         if attn_mode == "sliding_window":
             assert WINDOW_SIZE
-            assert WINDOW_SIZE < SEQ_LEN
+            # assert WINDOW_SIZE < SEQ_LEN
 
         # Tensor where we will store the output
         O = torch.empty_like(Q)

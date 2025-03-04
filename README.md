@@ -9,7 +9,7 @@ Currently supporting:
 - Backward passe
 - Causal Attention
 - Global Attention
-- Sliding Window Attention (Still working on it...)
+- Sliding Window Attention !!!
 
 
 <!-- Other ideas:

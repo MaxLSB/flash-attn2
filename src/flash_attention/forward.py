@@ -147,7 +147,7 @@ def _attn_fwd(
         )
 
     elif MODE == 1:  # Causal
-        # Stage 1: Runs for the blocks between on the left of the diagonal
+        # Stage 1: Runs for the blocks on the left of the main diagonal (full attention)
         O_block, l_i, m_i = _attn_fwd_inner(
             O_block,
             l_i,
@@ -187,7 +187,7 @@ def _attn_fwd(
         )
 
     elif MODE == 2:  # Sliding Window
-        # Stage 1: Runs for the blocks in between the two diagonals
+        # Stage 1: Runs for the blocks in between the two diagonals (full attention)
         O_block, l_i, m_i = _attn_fwd_inner(
             O_block,
             l_i,
@@ -206,7 +206,7 @@ def _attn_fwd(
             MODE,
             1,
         )
-        # Stage 2: Runs for the blocks on the right diagonal (Transition between non-masked and masked keys)
+        # Stage 2: Blocks on the right side of the sliding window (Transition between non-masked and masked keys)
         O_block, l_i, m_i = _attn_fwd_inner(
             O_block,
             l_i,
@@ -225,7 +225,7 @@ def _attn_fwd(
             MODE,
             2,
         )
-        # Stage 3: Runs for the blocks on the left diagonal (Transition between non-masked and masked keys)
+        # Stage 3: Blocks on the left side of the sliding window (Transition between non-masked and masked keys)
         O_block, l_i, m_i = _attn_fwd_inner(
             O_block,
             l_i,
@@ -301,44 +301,55 @@ def _attn_fwd_inner(
     elif MODE == 2:  # Sliding Window
         # Compute the number of blocks to attend on each side of the main diagonal
         half_window = WINDOW_SIZE // 2
-        window_block_right = tl.cdiv(1 + half_window, BLOCK_SIZE_Q)
+        window_block_index = tl.cdiv(1 + half_window, BLOCK_SIZE_Q)
         NUM_BLOCKS_Q = tl.cdiv(SEQ_LEN, BLOCK_SIZE_Q)
 
         if STAGE == 1:
-            # Blocks in between the right and left diagonals
+            # Blocks in between the right and left diagonals, where there is full attention
+            # ! Doesn't handle the case where WINDOW_SIZE//2 <= BLOCK_SIZE_Q
             if (half_window + 1) % BLOCK_SIZE_Q == 0:
-                lower = max(0, block_index_q - window_block_right + 1) * BLOCK_SIZE_Q
+                lower = max(0, block_index_q - window_block_index + 1) * BLOCK_SIZE_Q
+                higher = (
+                    min(NUM_BLOCKS_Q, block_index_q + window_block_index) * BLOCK_SIZE_Q
+                )
             else:
-                lower = max(0, block_index_q - window_block_right + 2) * BLOCK_SIZE_Q
-            
-            if (half_window + 1) % BLOCK_SIZE_Q == 0:
-                higher = min(NUM_BLOCKS_Q, block_index_q + window_block_right) * BLOCK_SIZE_Q
-            else:
-                higher = min(NUM_BLOCKS_Q, block_index_q + window_block_right - 1) * BLOCK_SIZE_Q
+                lower = max(0, block_index_q - window_block_index + 2) * BLOCK_SIZE_Q
+                higher = (
+                    min(NUM_BLOCKS_Q, block_index_q + window_block_index - 1)
+                    * BLOCK_SIZE_Q
+                )
 
         elif STAGE == 2:
-            # Blocks in the right diagonal, where there is transition between non-masked and masked keys
+            # Blocks on the right side of the sliding window, where there is transition between non-masked and masked keys
+            # Note: if half_window is not divisible by BLOCK_SIZE_Q then there are 2 diagonals to handle at this stage
+            # if half_window is divisible by BLOCK_SIZE_Q then there is only a single diagonal to handle at this stage
             if (half_window + 1) % BLOCK_SIZE_Q == 0:
-                lower = min(NUM_BLOCKS_Q, block_index_q + window_block_right) * BLOCK_SIZE_Q
+                lower = (
+                    min(NUM_BLOCKS_Q, block_index_q + window_block_index) * BLOCK_SIZE_Q
+                )
             else:
-                lower = min(NUM_BLOCKS_Q, block_index_q + window_block_right - 1) * BLOCK_SIZE_Q
-            
-            if lower < NUM_BLOCKS_Q * BLOCK_SIZE_Q:
-                higher = lower + BLOCK_SIZE_Q
-            else:
-                higher = lower
+                lower = (
+                    min(NUM_BLOCKS_Q, block_index_q + window_block_index - 1)
+                    * BLOCK_SIZE_Q
+                )
+
+            higher = (
+                min(NUM_BLOCKS_Q, block_index_q + window_block_index + 1) * BLOCK_SIZE_Q
+            )
 
         elif STAGE == 3:
-            # Blocks in the left diagonal, where there is transition between non-masked and masked keys
+            # Blocks on the left side of the sliding window, where there is transition between non-masked and masked keys
+            # Note: if half_window is not divisible by BLOCK_SIZE_Q then there are 2 diagonals do deal with on the left side
+            # if half_window is divisible by BLOCK_SIZE_Q then there is only a single diagonal to handle at this stage
             if (half_window + 1) % BLOCK_SIZE_Q == 0:
-                higher = max(0, block_index_q - window_block_right + 1) * BLOCK_SIZE_Q
+                higher = max(0, block_index_q - window_block_index + 1) * BLOCK_SIZE_Q
             else:
-                higher = max(0, block_index_q - window_block_right + 2) * BLOCK_SIZE_Q
-            
-            if higher > 0:
-                lower = higher - BLOCK_SIZE_Q
-            else:
-                lower = higher
+                higher = max(0, block_index_q - window_block_index + 2) * BLOCK_SIZE_Q
+
+            lower = (
+                max(0, block_index_q - tl.cdiv(half_window, BLOCK_SIZE_Q))
+                * BLOCK_SIZE_Q
+            )
 
         lower = tl.multiple_of(lower, BLOCK_SIZE_Q)
         higher = tl.multiple_of(higher, BLOCK_SIZE_Q)
@@ -370,23 +381,19 @@ def _attn_fwd_inner(
             # subtracting the row-wise max for numerical stability
             S_block -= m_ij[:, None]
 
-        # ! EDGE CASE WHERE WINDOW_SIZE < BLOCK_SIZE_Q !
-        # ! EDGE CASE where WINDOW_SIZE is even
-
         elif MODE == 2 and (STAGE == 2 or STAGE == 3):  # Sliding Window - Stage 2, 3
             half_window = WINDOW_SIZE // 2
-            j = start_kv + kv_offsets[None, :]
 
             if STAGE == 2:  # Right diagonal so the upper triangle part is masked
                 # TRUE for the valid tokens
                 mask = (
-                    (q_offsets[:, None] + half_window >= j) & (j >= 0) & (j < SEQ_LEN)
+                    q_offsets[:, None] + half_window >= start_kv + kv_offsets[None, :]
                 )
 
             elif STAGE == 3:  # Left diagonal so the lower triangle part is masked
                 # TRUE for the valid tokens
                 mask = (
-                    (q_offsets[:, None] - half_window <= j) & (j >= 0) & (j < SEQ_LEN)
+                    q_offsets[:, None] - half_window <= start_kv + kv_offsets[None, :]
                 )
 
             # Apply mask by adding -1.0e6 to False positions
