@@ -25,8 +25,6 @@ def multi_head_attention(Q, K, V, WINDOW_SIZE, attn_mode):
         MASK = torch.tril(all_ones)
 
     elif attn_mode == "sliding_window":
-        # If WINDOW_SIZE is even, each side of the window has half_window elements
-        # If WINDOW_SIZE is odd, the center token is included, so each side still has half_window elements
         half_window = WINDOW_SIZE // 2
         MASK = torch.triu(all_ones, -1 * half_window) * torch.tril(
             all_ones, half_window

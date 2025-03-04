@@ -7,7 +7,7 @@ from src.flash_attention.flash_attention import FlashAttention
 from src.multi_head_attention import multi_head_attention
 
 
-###################################### Benchmark ######################################
+###################################### Benchmark Runtime ######################################
 
 
 def benchmark(
@@ -56,8 +56,8 @@ def benchmark(
 
     # Plot results
     plt.figure(figsize=(8, 6))
-    plt.plot(seq_lens, np.array(torch_times) * 1000 + 1, label="PyTorch", marker="o")
-    plt.plot(seq_lens, np.array(triton_times) * 1000 + 1, label="Triton", marker="s")
+    plt.plot(seq_lens, np.array(torch_times) * 1000 + 1e-2, label="PyTorch", marker="o")
+    plt.plot(seq_lens, np.array(triton_times) * 1000 + 1e-2, label="Triton", marker="s")
     plt.xlabel("Sequence Length")
     plt.ylabel("Runtime (ms)")
     plt.title("PyTorch vs Triton Attention Runtime (Forward Pass)")
@@ -69,9 +69,9 @@ def benchmark(
 
 
 if __name__ == "__main__":
-    seq_lens = [512, 1024, 2048, 4096, 8192]
+    seq_lens = [128, 512, 1024, 2048, 4096, 8192]
     benchmark(
-        BATCH_SIZE=4,
+        BATCH_SIZE=8,
         NUM_HEADS=4,
         HEAD_DIM=64,
         WINDOW_SIZE=None,
