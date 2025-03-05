@@ -17,26 +17,25 @@ def multi_head_attention(Q, K, V, WINDOW_SIZE, attn_mode):
     # Q, K, V are already: (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM)
     _, _, SEQ_LEN, HEAD_DIM = Q.shape
 
+    attn_bias = torch.zeros(SEQ_LEN, SEQ_LEN, dtype=Q.dtype, device=Q.device)
     softmax_factor = 1 / HEAD_DIM**0.5
 
-    all_ones = torch.ones((SEQ_LEN, SEQ_LEN), device="cuda")
-
     if attn_mode == "causal":
-        MASK = torch.tril(all_ones)
-
-    elif attn_mode == "sliding_window":
-        half_window = WINDOW_SIZE // 2
-        MASK = torch.triu(all_ones, -1 * half_window) * torch.tril(
-            all_ones, half_window
+        MASK = torch.ones(SEQ_LEN, SEQ_LEN, dtype=torch.bool, device=Q.device).tril(
+            diagonal=0
         )
+        attn_bias.masked_fill_(MASK.logical_not(), float("-inf"))
 
-    # Compute attention scores
+    if attn_mode == "sliding_window":
+        all_ones = torch.ones(SEQ_LEN, SEQ_LEN, dtype=torch.bool, device=Q.device)
+        half_window = WINDOW_SIZE // 2
+        MASK = torch.triu(all_ones, diagonal=-half_window) & torch.tril(
+            all_ones, diagonal=half_window
+        )
+        attn_bias.masked_fill_(MASK.logical_not(), float("-inf"))
+
     P = torch.matmul(Q, K.transpose(-2, -1)) * softmax_factor
-
-    # Add the computed mask
-    if attn_mode == "causal" or attn_mode == "sliding_window":
-        P[:, :, MASK == 0] = float("-inf")
-
+    P += attn_bias
     # Change P to float32 before softmax for numerical stability and precision and back to float16 afterwards
     attn_weights = torch.softmax(P.float(), dim=-1).half()
     attn_output = torch.matmul(attn_weights, V)
