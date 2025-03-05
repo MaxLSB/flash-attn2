@@ -67,7 +67,7 @@ configs = [
     )
     for BLOCK_SIZE_Q in [16]
     for BLOCK_SIZE_KV in [16]
-    for num_stages in ([3, 4, 7])
+    for num_stages in [3, 4, 7]
     for num_warps in [2, 4]
 ]
 

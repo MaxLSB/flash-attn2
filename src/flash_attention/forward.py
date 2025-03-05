@@ -13,7 +13,7 @@ import triton.language as tl
         )
         for BLOCK_SIZE_Q in [16]
         for BLOCK_SIZE_KV in [16]
-        for num_stages in ([3, 4, 7])
+        for num_stages in [3, 4, 7]
         for num_warps in [2, 4]
     ],
     key=["SEQ_LEN", "HEAD_DIM"],
@@ -306,7 +306,6 @@ def _attn_fwd_inner(
 
         if STAGE == 1:
             # Blocks in between the right and left diagonals, where there is full attention
-            # ! Doesn't handle the case where WINDOW_SIZE//2 <= BLOCK_SIZE_Q
             if (half_window + 1) % BLOCK_SIZE_Q == 0:
                 lower = max(0, block_index_q - window_block_index + 1) * BLOCK_SIZE_Q
                 higher = (

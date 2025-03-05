@@ -67,7 +67,6 @@ def benchmark(
         seq_lens,
         results["torch"],
         label="PyTorch Attention",
-        marker="o",
         linestyle="-",
         markersize=6,
         linewidth=2,
@@ -76,21 +75,21 @@ def benchmark(
         seq_lens,
         results["triton"],
         label="FlashAttention-2 Triton",
-        marker="s",
         linestyle="--",
         markersize=6,
         linewidth=2,
     )
     plt.title(
-        f"{attn_mode.capitalize()} Attention forward + backward speed (RTX 4060)",
+        f"{attn_mode.capitalize()} Attention forward + backward speed (RTX 3060)",
         fontsize=12,
         fontweight="bold",
     )
     plt.yticks(fontsize=10)
     plt.xticks([512, 1024, 2048, 4096, 8192], fontsize=10)
-    plt.legend(fontsize=12, loc="upper left", frameon=True)
+    plt.legend(fontsize=12, loc="center right", frameon=True)
     plt.xlabel("Sequence Length", fontsize=12, fontweight="bold")
-    plt.ylabel("Speed (TFLOPs/s)", fontsize=12, fontweight="bold")
+    plt.ylabel("Speed (TFLOPS)", fontsize=12, fontweight="bold")
+    plt.savefig("media/benchmark.png", dpi=300)
     plt.show()
 
 
@@ -137,9 +136,15 @@ def compute_flops(
     start_time = time.perf_counter()
     fn()
     torch.cuda.synchronize()
-    fwd_ms = (time.perf_counter() - start_time) * 1e3  # Convert to milliseconds
+    fwd_sec = time.perf_counter() - start_time
     flops_per_matmul = 2.0 * BATCH_SIZE * NUM_HEADS * SEQ_LEN * SEQ_LEN * HEAD_DIM
-    fwd_flops = 2 * flops_per_matmul * 0.5
+    fwd_flops = 2 * flops_per_matmul  # Forward pass has 2 matmul
+
+    if attn_mode == "causal":
+        fwd_flops *= 0.5  # half the global flops
+    elif attn_mode == "sliding_window":
+        # An estimation not exactly this
+        fwd_flops *= WINDOW_SIZE / SEQ_LEN
 
     # Backward pass
     O = fn()
@@ -147,18 +152,29 @@ def compute_flops(
     start_time = time.perf_counter()
     O.backward(dO, retain_graph=True)
     torch.cuda.synchronize()
-    bwd_ms = (time.perf_counter() - start_time) * 1e3  # Convert to milliseconds
-    bwd_flops = 2 * flops_per_matmul * 0.5
-    bwd_flops = bwd_flops * 2.5  # 2.0(bwd) + 0.5(recompute)
+    bwd_sec = time.perf_counter() - start_time
+    bwd_flops = fwd_flops
+    if attn_mode == "causal":
+        # 2.0 (bwd) + 0.5 (recompute)
+        bwd_flops *= 2.0 + 0.5
+    elif attn_mode == "sliding_window":
+        # 2.0 (bwd) + WINDOW_SIZE / SEQ_LEN (recompute)
+        bwd_flops *= 2.0 + WINDOW_SIZE / SEQ_LEN
+    elif attn_mode == "global":
+        # 2.0 (bwd)
+        bwd_flops *= 2.0
 
-    return fwd_flops * 1e-12 / (fwd_ms * 1e-3) + bwd_flops * 1e-12 / (bwd_ms * 1e-3)
+    # TFLOPS
+    total_flops = (fwd_flops / fwd_sec + bwd_flops / bwd_sec) * 1e-12
+
+    return total_flops
 
 
 if __name__ == "__main__":
     args = parse_args()
 
     # Set the sequence lengths to benchmark
-    seq_lens = [512 * i for i in range(4, 14)]
+    seq_lens = [512 * i for i in range(1, 14)]
 
     benchmark(
         BATCH_SIZE=args.batch_size,
