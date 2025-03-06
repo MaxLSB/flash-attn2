@@ -1,4 +1,4 @@
-# FlashAttention-2 in Triton with Sliding Window Attention
+# FlashAttention-2 in Triton for Sliding Window Attention
 
 This repository provides an implementation of FlashAttention-2 **Forward and Backward Pass** for self-attention in Triton which handles **Sliding Window Attention**. FlashAttention-2 is a memory-efficient algorithm for computing attention that significantly reduces memory bandwidth requirements and improves performance on GPU hardware.
 
@@ -55,7 +55,7 @@ Each test verifies:
 ## Installation
 
 ```bash
-git clone https://github.com/MaxLSB/flash-attention-2.git
+git clone https://github.com/MaxLSB/flash-attn2.git
 ```
 
 ## To Do
