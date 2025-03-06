@@ -1,12 +1,12 @@
 import torch
 import matplotlib.pyplot as plt
-import time
 import argparse
+import torch.utils.benchmark as benchmark
 
 from src.flash_attention.flash_attention import FlashAttention
 from src.multi_head_attention import multi_head_attention
 
-###################################### Benchmark Speed ######################################
+###################################### Benchmark Speed (TFLOPs/s) for Fwd + Bwd Pass ######################################
 
 
 def parse_args():
@@ -36,33 +36,153 @@ def parse_args():
     return parser.parse_args()
 
 
-def benchmark(
-    BATCH_SIZE,
-    NUM_HEADS,
-    HEAD_DIM,
-    WINDOW_SIZE,
+def calculate_flops(seq_len, batch_size, num_heads, head_dim, attn_mode, window_size):
+    """Calculate floating point operations for attention mechanisms."""
+    flops_per_matmul = 2.0 * batch_size * num_heads * seq_len * seq_len * head_dim
+    fwd_flops = 2 * flops_per_matmul  # Forward pass has 2 matmul
+    bwd_flops = 5 * flops_per_matmul  # Backward pass has 5 matmul
+
+    if attn_mode == "causal":
+        # Approximate half the global flops for causal attention
+        fwd_flops *= 0.5
+        bwd_flops *= 0.5
+    elif attn_mode == "sliding_window":
+        # Scale by window size ratio for sliding window attention
+        ratio = window_size / seq_len
+        fwd_flops *= ratio
+        bwd_flops *= ratio
+
+    return fwd_flops, bwd_flops
+
+
+def calculate_efficiency(flops, time):
+    """Convert raw FLOPS to TFLOPs/s."""
+    return flops / time / 1e12
+
+
+def benchmark_time_combined(
+    fn, *inputs, grad=None, repeats=10, amp_dtype=torch.float16, **kwinputs
+):
+    """Benchmark forward and backward pass of an arbitrary function using torch.utils.benchmark."""
+
+    def combined_fn(grad, *inputs, **kwinputs):
+        # Reset gradients to avoid accumulation
+        for x in inputs:
+            if isinstance(x, torch.Tensor):
+                x.grad = None
+
+        # Forward pass with AMP if enabled
+        with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=True):
+            attn_out = fn(*inputs, **kwinputs)
+
+        # Backward pass
+        attn_out.backward(grad, retain_graph=True)
+
+    # Warmup run to compile
+    combined_fn(grad, *inputs, **kwinputs)
+    torch.cuda.synchronize()
+
+    # Timer for combined forward + backward pass
+    timer = benchmark.Timer(
+        stmt="combined_fn(grad, *inputs, **kwinputs)",
+        globals={
+            "combined_fn": combined_fn,
+            "fn": fn,
+            "inputs": inputs,
+            "grad": grad,
+            "kwinputs": kwinputs,
+        },
+        num_threads=torch.get_num_threads(),
+    )
+
+    # Return the mean time in seconds
+    time_result = timer.timeit(repeats)
+    return time_result.mean
+
+
+def run_attention_benchmark(
+    batch_size,
+    num_heads,
+    seq_len,
+    head_dim,
+    window_size,
+    attn_mode,
+    provider,
+    device="cuda",
+):
+    """Run benchmark for a specific attention implementation and configuration."""
+    dtype = torch.float16
+
+    # Create input tensors
+    Q = torch.randn(
+        (batch_size, num_heads, seq_len, head_dim),
+        dtype=dtype,
+        device=device,
+        requires_grad=True,
+    )
+    K = torch.randn(
+        (batch_size, num_heads, seq_len, head_dim),
+        dtype=dtype,
+        device=device,
+        requires_grad=True,
+    )
+    V = torch.randn(
+        (batch_size, num_heads, seq_len, head_dim),
+        dtype=dtype,
+        device=device,
+        requires_grad=True,
+    )
+    dO = torch.randn_like(Q)  # Gradient for backward pass
+
+    # Select appropriate attention implementation
+    if provider == "torch":
+        fn = lambda: multi_head_attention(Q, K, V, window_size, attn_mode)
+    elif provider == "triton":
+        fn = lambda: FlashAttention.apply(Q, K, V, window_size, attn_mode)
+
+    # Measure execution time
+    time = benchmark_time_combined(fn, grad=dO, repeats=10, amp_dtype=dtype)
+
+    # Calculate TFLOPs/s
+    fwd_flops, bwd_flops = calculate_flops(
+        seq_len, batch_size, num_heads, head_dim, attn_mode, window_size
+    )
+    total_tflops = calculate_efficiency(fwd_flops + bwd_flops, time)
+
+    return total_tflops
+
+
+def plot_benchmark_results(
+    batch_size,
+    num_heads,
+    head_dim,
+    window_size,
     attn_mode,
     seq_lens,
     device="cuda",
 ):
+    """Run benchmarks and plot results for comparison."""
     results = {"torch": [], "triton": []}
 
+    # Collect benchmark results for each provider and sequence length
     for provider in ["torch", "triton"]:
         for seq_len in seq_lens:
-            tflops = compute_flops(
-                BATCH_SIZE,
-                NUM_HEADS,
+            tflops = run_attention_benchmark(
+                batch_size,
+                num_heads,
                 seq_len,
-                HEAD_DIM,
-                WINDOW_SIZE,
+                head_dim,
+                window_size,
                 attn_mode,
                 provider,
                 device=device,
             )
             results[provider].append(tflops)
 
+    # Create the plot
     plt.figure(figsize=(8, 6), dpi=100)
     plt.style.use("seaborn-v0_8-darkgrid")
+
     plt.plot(
         seq_lens,
         results["torch"],
@@ -79,108 +199,35 @@ def benchmark(
         markersize=6,
         linewidth=2,
     )
+
+    # Set plot labels and styling
     plt.title(
-        f"{attn_mode.capitalize()} Attention forward + backward speed (RTX 3060)",
+        f"{attn_mode.capitalize()} attention forward + backward speed (RTX 4060 Laptop GPU)",
         fontsize=12,
         fontweight="bold",
     )
     plt.yticks(fontsize=10)
-    plt.xticks([512, 1024, 2048, 4096, 8192], fontsize=10)
+    plt.xticks(fontsize=10)
     plt.legend(fontsize=12, loc="center right", frameon=True)
     plt.xlabel("Sequence Length", fontsize=12, fontweight="bold")
-    plt.ylabel("Speed (TFLOPS)", fontsize=12, fontweight="bold")
+    plt.ylabel("Speed (TFLOPs/s)", fontsize=12, fontweight="bold")
+
+    # Save and display the plot
     plt.savefig("media/benchmark.png", dpi=300)
     plt.show()
-
-
-def compute_flops(
-    BATCH_SIZE,
-    NUM_HEADS,
-    SEQ_LEN,
-    HEAD_DIM,
-    WINDOW_SIZE,
-    attn_mode,
-    provider,
-    device="cuda",
-):
-    dtype = torch.float16
-
-    Q = torch.randn(
-        (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM),
-        dtype=dtype,
-        device=device,
-        requires_grad=True,
-    )
-    K = torch.randn(
-        (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM),
-        dtype=dtype,
-        device=device,
-        requires_grad=True,
-    )
-    V = torch.randn(
-        (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM),
-        dtype=dtype,
-        device=device,
-        requires_grad=True,
-    )
-    dO = torch.randn_like(Q)
-
-    if provider == "torch":
-        fn = lambda: multi_head_attention(Q, K, V, WINDOW_SIZE, attn_mode)
-    elif provider == "triton":
-        fn = lambda: FlashAttention.apply(Q, K, V, WINDOW_SIZE, attn_mode)
-
-    # Forward Pass
-    fn()  # Warm-up run
-    torch.cuda.synchronize()
-    start_time = time.perf_counter()
-    fn()
-    torch.cuda.synchronize()
-    fwd_sec = time.perf_counter() - start_time
-    flops_per_matmul = 2.0 * BATCH_SIZE * NUM_HEADS * SEQ_LEN * SEQ_LEN * HEAD_DIM
-    fwd_flops = 2 * flops_per_matmul  # Forward pass has 2 matmul
-
-    if attn_mode == "causal":
-        fwd_flops *= 0.5  # half the global flops
-    elif attn_mode == "sliding_window":
-        # An estimation not exactly this
-        fwd_flops *= WINDOW_SIZE / SEQ_LEN
-
-    # Backward pass
-    O = fn()
-    torch.cuda.synchronize()
-    start_time = time.perf_counter()
-    O.backward(dO, retain_graph=True)
-    torch.cuda.synchronize()
-    bwd_sec = time.perf_counter() - start_time
-    bwd_flops = fwd_flops
-    if attn_mode == "causal":
-        # 2.0 (bwd) + 0.5 (recompute)
-        bwd_flops *= 2.0 + 0.5
-    elif attn_mode == "sliding_window":
-        # 2.0 (bwd) + WINDOW_SIZE / SEQ_LEN (recompute)
-        bwd_flops *= 2.0 + WINDOW_SIZE / SEQ_LEN
-    elif attn_mode == "global":
-        # 2.0 (bwd)
-        bwd_flops *= 2.0
-
-    # TFLOPS
-    total_flops = (fwd_flops / fwd_sec + bwd_flops / bwd_sec) * 1e-12
-
-    return total_flops
 
 
 if __name__ == "__main__":
     args = parse_args()
 
     # Set the sequence lengths to benchmark
-    seq_lens = [512 * i for i in range(1, 14)]
+    seq_lens = [512 * i for i in range(1, 12)]
 
-    benchmark(
-        BATCH_SIZE=args.batch_size,
-        NUM_HEADS=args.num_heads,
-        HEAD_DIM=args.head_dim,
-        WINDOW_SIZE=args.window_size,
+    plot_benchmark_results(
+        batch_size=args.batch_size,
+        num_heads=args.num_heads,
+        head_dim=args.head_dim,
+        window_size=args.window_size,
         attn_mode=args.attn_mode,
         seq_lens=seq_lens,
         device="cuda",
