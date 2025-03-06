@@ -14,15 +14,15 @@ Note:
 - No dropout is applied.
 - Uses FP16 precision.
 
+## Introduction
+
+This implementation replicates the trend described in the FlashAttention-2 paper, with significant performance improvements compared to traditional attention mechanisms.
+
 <div align="center">
   <img src="media/benchmark.png" alt="FlashAttention-2 Benchmarks" width="500" />
 </div>
 
 <br>
-
-## Introduction
-
-This implementation replicates the trend described in the FlashAttention-2 paper, with significant performance improvements compared to traditional attention mechanisms.
 
 --> Up to 2-10x speedup compared to a standard PyTorch attention implementation.
 
@@ -58,7 +58,7 @@ Each test verifies:
 git clone https://github.com/MaxLSB/flash-attention-2.git
 ```
 
-# To Do
+## To Do
 
 - Fix the current restrictions for Sliding Window:
   - SEQ_LEN >= 4 * BLOCK_SIZE

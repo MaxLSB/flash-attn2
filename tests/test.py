@@ -17,7 +17,7 @@ def parse_args():
         "--num_heads", type=int, default=4, help="Number of attention heads"
     )
     parser.add_argument(
-        "--head_dim", type=int, default=64, help="Dimension of each attention head"
+        "--head_dim", type=int, default=128, help="Dimension of each attention head"
     )
     parser.add_argument(
         "--window_size",

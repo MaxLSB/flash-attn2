@@ -13,12 +13,12 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Benchmark PyTorch vs Triton Attention Speed"
     )
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
     parser.add_argument(
         "--num_heads", type=int, default=4, help="Number of attention heads"
     )
     parser.add_argument(
-        "--head_dim", type=int, default=64, help="Dimension of each attention head"
+        "--head_dim", type=int, default=128, help="Dimension of each attention head"
     )
     parser.add_argument(
         "--window_size",
@@ -61,7 +61,7 @@ def calculate_efficiency(flops, time):
 
 
 def benchmark_time_combined(
-    fn, *inputs, grad=None, repeats=10, amp_dtype=torch.float16, **kwinputs
+    fn, *inputs, grad=None, repeats=5, amp_dtype=torch.float16, **kwinputs
 ):
     """Benchmark forward and backward pass of an arbitrary function using torch.utils.benchmark."""
 
@@ -141,7 +141,10 @@ def run_attention_benchmark(
         fn = lambda: FlashAttention.apply(Q, K, V, window_size, attn_mode)
 
     # Measure execution time
-    time = benchmark_time_combined(fn, grad=dO, repeats=10, amp_dtype=dtype)
+    time = benchmark_time_combined(fn, grad=dO, repeats=5, amp_dtype=dtype)
+    print(
+        f"> {provider.capitalize()} Attention | Seq_len={seq_len} | {time*1e3:.4f} ms"
+    )
 
     # Calculate TFLOPs/s
     fwd_flops, bwd_flops = calculate_flops(
@@ -221,7 +224,7 @@ if __name__ == "__main__":
     args = parse_args()
 
     # Set the sequence lengths to benchmark
-    seq_lens = [512 * i for i in range(1, 12)]
+    seq_lens = [512 * i for i in range(1, 11)]
 
     plot_benchmark_results(
         batch_size=args.batch_size,
