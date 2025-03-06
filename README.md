@@ -1,12 +1,10 @@
 # FlashAttention-2 in Triton with Sliding Window Attention
 
-## Introduction
-
-This repository provides an implementation of FlashAttention-2 **Forward and Backward Pass** for self-attention in Triton and which handles **Sliding Window Attention**. FlashAttention-2 is a memory-efficient algorithm for computing attention that significantly reduces memory bandwidth requirements and improves performance on GPU hardware.
+This repository provides an implementation of FlashAttention-2 **Forward and Backward Pass** for self-attention in Triton which handles **Sliding Window Attention**. FlashAttention-2 is a memory-efficient algorithm for computing attention that significantly reduces memory bandwidth requirements and improves performance on GPU hardware.
 
 This implementation supports several configurations for both Forward and Backward Pass including:
 
-- **Sliding Window Attention**
+- **Sliding Window Attention** !!!
 - **Global Attention**
 - **Causal Attention**
 
@@ -16,40 +14,43 @@ Note:
 - No dropout is applied.
 - Uses FP16 precision.
 
-## Benchmarking
-
 <div align="center">
   <img src="media/benchmark.png" alt="FlashAttention-2 Benchmarks" width="500" />
 </div>
 
 <br>
 
-This implementation replicates the trend described in the paper with significant performance improvements compared to traditional attention mechanisms.
+## Introduction
 
-- Up to 2-10x speedup compared to a standard PyTorch attention implementation
+This implementation replicates the trend described in the FlashAttention-2 paper, with significant performance improvements compared to traditional attention mechanisms.
 
-## Implementation Details
+--> Up to 2-10x speedup compared to a standard PyTorch attention implementation.
 
-The implementation leverages Triton's capabilities to generate efficient CUDA kernels on the fly. Key optimizations include:
+This implementation differs slightly from the pseudo-code in the original paper, mainly in the backward pass, which is modified based on the Triton documentation implementation for better performance.
 
-- Block-sparse computation patterns for sliding window attention
-- Memory-efficient backward pass with gradient accumulation
-- Fused softmax operations to reduce memory bandwidth
-- Optimized tiling strategies for different attention patterns
+## Benchmarking
+
+Measure the speed (in TFLOPs/s) of FlashAttention-2 in Triton versus standard PyTorch attention for the forward + backward pass with the `benchmark.py` file:
+
+```bash
+python -m tests.benchmark --attn_mode 'sliding_window' --window_size 500
+python -m tests.benchmark --attn_mode 'causal' --batch_size 16
+python -m tests.benchmark --attn_mode 'global' --num_heads 8
+```
 
 ## Testing
 
-Test file to ensure that the results from PyTorch and Triton implementation match:
+Compare the results between the PyTorch and Triton implementations with the `test.py` file:
 
 ```bash
 python -m tests.test --attn_mode 'sliding_window' --window_size 1000
-python -m tests.test --attn_mode 'causal'
-python -m tests.test --attn_mode 'global'
+python -m tests.test --attn_mode 'causal' --head_dim 128
+python -m tests.test --attn_mode 'global' --batch_size 8
 ```
 
 Each test verifies:
-- Numerical accuracy against a Standard PyTorch implementation
-- Gradient correctness
+- Numerical accuracy against a standard PyTorch implementation.
+- Gradient correctness.
 
 ## Installation
 
@@ -60,8 +61,8 @@ git clone https://github.com/MaxLSB/flash-attention-2.git
 # To Do
 
 - Fix the current restrictions for Sliding Window:
-$$ \text{SEQ\_LEN} \geq 4 \times \text{BLOCK\_SIZE} $$
-$$ 2 \times \text{BLOCK\_SIZE} \leq \text{WINDOW\_SIZE} \leq \text{SEQ\_LEN} $$
+  - SEQ_LEN >= 4 * BLOCK_SIZE
+  - 2 * BLOCK_SIZE <= WINDOW_SIZE <= SEQ_LEN 
 - Improve the Autotune in the backward pass
 
 
